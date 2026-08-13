@@ -1574,7 +1574,17 @@ if transcribe_clicked:
         import torch
         import torchaudio
 
-        from app import predict, device
+        try:
+            from app import predict, device
+        except ModuleNotFoundError as exc:
+            if exc.name == "fastapi":
+                st.error(
+                    "FastAPI is missing in this deployment. "
+                    "Add fastapi, uvicorn, and python-multipart to requirements.txt "
+                    "and redeploy."
+                )
+                st.stop()
+            raise
 
         # =================================================
         # READ AUDIO

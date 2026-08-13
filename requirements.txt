@@ -11,3 +11,6 @@ langchain-huggingface
 langchain-text-splitters
 chromadb
 sentence-transformers
+fastapi
+uvicorn
+python-multipart
