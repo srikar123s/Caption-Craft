@@ -28,8 +28,27 @@ class SpeechRecognitionModel(nn.Module):
         return out
 
 # 🔹 Load model
+from pathlib import Path
+
 model = SpeechRecognitionModel().to(device)
-model.load_state_dict(torch.load("C:/Users/srikar/OneDrive/Desktop/soft/1nfine_tuned_model.pth", map_location=device))
+# Load model from workspace-relative path (falls back to absolute if needed)
+default_model_path = Path(__file__).parent / "1nfine_tuned_model.pth"
+alt_model_path = Path("C:/Users/srikar/OneDrive/Desktop/soft/1nfine_tuned_model.pth")
+
+if default_model_path.exists():
+    model_path = default_model_path
+elif alt_model_path.exists():
+    model_path = alt_model_path
+else:
+    raise FileNotFoundError(
+        f"Model file not found. Expected at {default_model_path!s} or {alt_model_path!s}."
+    )
+
+try:
+    model.load_state_dict(torch.load(model_path, map_location=device))
+except Exception as e:
+    raise RuntimeError(f"Failed to load model from {model_path!s}: {e}")
+
 model.eval()
 
 # 🔹 Inference function
