@@ -2,9 +2,12 @@ streamlit
 torch
 torchaudio
 soundfile
-groq
-fastapi
-uvicorn
-python-multipart
-pydantic
+numpy
 faster-whisper
+groq
+langchain
+langchain-chroma
+langchain-huggingface
+langchain-text-splitters
+chromadb
+sentence-transformers

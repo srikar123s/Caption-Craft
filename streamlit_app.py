@@ -2,19 +2,36 @@ import streamlit as st
 import io
 import time
 import os
+import json
 import re
+import hashlib
 import tempfile
+import importlib
+import textwrap
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-import torch
-import torchaudio
 
-from faster_whisper import WhisperModel
-from groq import Groq
+# Keep the app startup lightweight by importing ML packages only when needed.
+# This avoids Streamlit scanning heavy libraries on every refresh and reduces
+# the time it takes the app to open.
 
-from app import predict, device
+
+def _ensure_audio_runtime():
+    import torch
+    import torchaudio
+    from faster_whisper import WhisperModel
+    return torch, torchaudio, WhisperModel
+
+
+def _load_module(module_name, package_name=None):
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        install_name = package_name or module_name
+        raise ModuleNotFoundError(
+            f"{module_name} is missing. Install it in the venv with: "
+            f"pip install {install_name}"
+        ) from exc
 
 
 # =========================================================
@@ -34,10 +51,12 @@ st.set_page_config(
 
 @st.cache_resource
 def load_whisper():
+    import torch
+    from faster_whisper import WhisperModel
 
-    model_path = "./whisper-tiny.en"
+    model_path = Path(__file__).resolve().parent / "whisper-tiny.en"
 
-    if not os.path.exists(model_path):
+    if not model_path.exists():
         raise FileNotFoundError(
             f"Whisper model not found at: {model_path}"
         )
@@ -54,8 +73,10 @@ def load_whisper():
         f"with {compute_type}..."
     )
 
+    _, _, WhisperModel = _ensure_audio_runtime()
+
     model = WhisperModel(
-        model_path,
+        str(model_path),
         device=whisper_device,
         compute_type=compute_type
     )
@@ -69,6 +90,7 @@ def load_whisper():
 
 @st.cache_resource
 def load_ai_client():
+    from groq import Groq
 
     api_key = st.secrets.get(
         "GROQ_API_KEY"
@@ -219,65 +241,105 @@ def normalize_text(text):
     return text
 
 # =========================================================
-# AI TRANSCRIPT INTELLIGENCE
+# AI TRANSCRIPT INTELLIGENCE — STRUCTURED EXTRACTION
 # =========================================================
 
 def analyze_transcript(transcript):
+    """Analyze the final transcript and return structured JSON."""
 
     client = load_ai_client()
 
     if client is None:
         raise ValueError(
-            "GROQ_API_KEY is not configured."
+            "GROQ_API_KEY is not configured. "
+            "Add it to Streamlit secrets."
         )
 
+    if not transcript or not transcript.strip():
+        raise ValueError("Transcript is empty.")
 
     prompt = f"""
-You are an AI transcript analysis assistant.
+You are a precise information extraction assistant.
 
-Analyze the following final speech transcript.
+Analyze the following FINAL speech transcript and return ONLY valid JSON.
 
-Return the result using exactly these four sections:
-
-SUMMARY:
-Give a concise 3-5 sentence summary.
-
-KEY POINTS:
-Give 3-6 important points as bullet points.
-
-ACTION ITEMS:
-List important tasks, decisions, or follow-up actions
-mentioned in the transcript.
-
-If there are no action items, write:
-No specific action items identified.
-
-QUALITY:
-Give a score from 0 to 100 and briefly explain the
-transcript quality.
-
-Consider:
-- clarity
-- completeness
-- repetition
-- possible transcription errors
-
-Transcript:
+TRANSCRIPT:
 {transcript}
+
+Extract:
+
+1. summary
+   - Concise 3-5 sentence summary.
+
+2. key_points
+   - Important points discussed.
+
+3. action_items
+   - Tasks or follow-up actions explicitly mentioned.
+   - Each item must contain task, owner, and deadline.
+   - Use "" if owner/deadline is not mentioned.
+
+4. people
+   - People explicitly mentioned.
+
+5. organizations
+   - Companies, institutions, teams, or organizations explicitly mentioned.
+
+6. dates
+   - Dates, deadlines, days, months, years, or explicit time references.
+
+7. numbers
+   - Important numerical information with its context.
+   - Preserve values exactly as stated.
+
+8. decisions
+   - Explicit decisions, agreements, conclusions, or choices.
+
+9. quality
+   - score: integer from 0 to 100.
+   - explanation: short explanation based on clarity,
+     completeness, repetition, and possible transcription errors.
+
+STRICT RULES:
+- Use ONLY information present in the transcript.
+- Never invent information.
+- If a category is absent, return an empty list.
+- Preserve numerical values exactly as stated.
+- Return ONLY valid JSON.
+- Do not use markdown code fences.
+
+Return exactly:
+
+{{
+    "summary": "",
+    "key_points": [],
+    "action_items": [
+        {{
+            "task": "",
+            "owner": "",
+            "deadline": ""
+        }}
+    ],
+    "people": [],
+    "organizations": [],
+    "dates": [],
+    "numbers": [],
+    "decisions": [],
+    "quality": {{
+        "score": 0,
+        "explanation": ""
+    }}
+}}
 """
 
-
     response = client.chat.completions.create(
-
         model="llama-3.3-70b-versatile",
-
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a professional transcript "
-                    "analysis assistant. "
-                    "Be concise, factual, and easy to understand."
+                    "You are a precise transcript information "
+                    "extraction system. Return valid JSON only."
                 )
             },
             {
@@ -285,228 +347,692 @@ Transcript:
                 "content": prompt
             }
         ],
-
-        temperature=0.2,
-
-        max_tokens=1500
+        temperature=0,
+        max_tokens=2000
     )
 
+    raw = response.choices[0].message.content.strip()
 
-    return (
-        response
-        .choices[0]
-        .message
-        .content
-    )
+    # Remove accidental markdown fences.
+    if raw.startswith("```"):
+        raw = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE
+        )
+        raw = re.sub(r"\s*```$", "", raw).strip()
 
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            raise ValueError(
+                "Groq returned invalid JSON."
+            )
+        data = json.loads(match.group(0))
 
-# =========================================================
-# AI ANALYSIS PARSER
-# =========================================================
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Groq returned an invalid JSON object."
+        )
 
-
-def parse_ai_analysis(raw_text):
-
-    text = (raw_text or "").strip()
-
-    if not text:
-        return {
-            "summary": "No summary available.",
-            "key_points": [],
-            "action_items": [],
-            "quality": "Quality not available."
-        }
-
-    sections = {
+    # Safe defaults.
+    defaults = {
         "summary": "",
         "key_points": [],
         "action_items": [],
-        "quality": ""
+        "people": [],
+        "organizations": [],
+        "dates": [],
+        "numbers": [],
+        "decisions": [],
+        "quality": {
+            "score": 0,
+            "explanation": ""
+        }
     }
 
-    text = text.replace("\r\n", "\n")
+    for key, value in defaults.items():
+        data.setdefault(key, value)
 
-    summary_match = re.search(
-        r"SUMMARY:\s*(.*?)(?=\n\s*KEY POINTS:|\n\s*ACTION ITEMS:|\n\s*QUALITY:|$)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
+    # Normalize list fields.
+    list_fields = [
+        "key_points",
+        "people",
+        "organizations",
+        "dates",
+        "numbers",
+        "decisions"
+    ]
+
+    for field in list_fields:
+        if not isinstance(data[field], list):
+            data[field] = [str(data[field])]
+
+    # Normalize action items.
+    cleaned_actions = []
+
+    if isinstance(data["action_items"], list):
+        for item in data["action_items"]:
+            if isinstance(item, dict):
+                cleaned_actions.append({
+                    "task": str(item.get("task", "")).strip(),
+                    "owner": str(item.get("owner", "")).strip(),
+                    "deadline": str(item.get("deadline", "")).strip()
+                })
+            else:
+                cleaned_actions.append({
+                    "task": str(item).strip(),
+                    "owner": "",
+                    "deadline": ""
+                })
+
+    data["action_items"] = cleaned_actions
+
+    # Normalize quality.
+    if not isinstance(data["quality"], dict):
+        data["quality"] = {
+            "score": 0,
+            "explanation": str(data["quality"])
+        }
+
+    try:
+        score = int(data["quality"].get("score", 0))
+    except (TypeError, ValueError):
+        score = 0
+
+    data["quality"]["score"] = max(
+        0,
+        min(100, score)
     )
 
-    if summary_match:
-        sections["summary"] = summary_match.group(1).strip()
+    data["quality"]["explanation"] = str(
+        data["quality"].get("explanation", "")
+    ).strip()
 
-    key_points_match = re.search(
-        r"KEY POINTS:\s*(.*?)(?=\n\s*ACTION ITEMS:|\n\s*QUALITY:|$)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
+    data["summary"] = str(
+        data["summary"]
+    ).strip()
+
+    return data
+
+
+def render_ai_analysis(analysis):
+    """Render structured AI analysis in a clean Streamlit UI."""
+
+    if not isinstance(analysis, dict):
+        st.error("Invalid AI analysis format.")
+        return
+
+    summary = str(
+        analysis.get("summary", "")
+    ).strip()
+
+    key_points = analysis.get("key_points", [])
+    action_items = analysis.get("action_items", [])
+    people = analysis.get("people", [])
+    organizations = analysis.get("organizations", [])
+    dates = analysis.get("dates", [])
+    numbers = analysis.get("numbers", [])
+    decisions = analysis.get("decisions", [])
+    quality = analysis.get("quality", {})
+
+    try:
+        quality_score = int(
+            quality.get("score", 0)
+        )
+    except (TypeError, ValueError):
+        quality_score = 0
+
+    quality_score = max(
+        0,
+        min(100, quality_score)
     )
 
-    if key_points_match:
-        key_block = key_points_match.group(1).strip()
-        sections["key_points"] = [
-            item.strip("- *•\n ")
-            for item in key_block.split("\n")
-            if item.strip()
-        ]
+    # -----------------------------------------------------
+    # METRICS
+    # -----------------------------------------------------
 
-    action_items_match = re.search(
-        r"ACTION ITEMS:\s*(.*?)(?=\n\s*QUALITY:|$)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
+    m1, m2, m3, m4 = st.columns(4)
+
+    with m1:
+        st.metric(
+            "Transcript Quality",
+            f"{quality_score}/100"
+        )
+
+    with m2:
+        st.metric(
+            "Key Points",
+            len(key_points)
+        )
+
+    with m3:
+        st.metric(
+            "Action Items",
+            len(action_items)
+        )
+
+    with m4:
+        st.metric(
+            "Entities",
+            len(people) + len(organizations)
+        )
+
+    # -----------------------------------------------------
+    # SUMMARY
+    # -----------------------------------------------------
+
+    st.markdown(
+        '<div class="section-title">📝 Summary</div>',
+        unsafe_allow_html=True
     )
 
-    if action_items_match:
-        action_block = action_items_match.group(1).strip()
-        if action_block.lower().strip() == "no specific action items identified.":
-            sections["action_items"] = []
+    st.markdown(
+        textwrap.dedent(f"""
+        <div class="info-card">
+            {summary or '<span class="info-empty">No summary available.</span>'}
+        </div>
+        """),
+        unsafe_allow_html=True
+    )
+
+    # -----------------------------------------------------
+    # KEY POINTS
+    # -----------------------------------------------------
+
+    st.markdown(
+        '<div class="section-title">🔑 Key Points</div>',
+        unsafe_allow_html=True
+    )
+
+    if key_points:
+
+        key_text = "".join(
+            f"<li>{str(item)}</li>"
+            for item in key_points
+        )
+
+        st.markdown(
+            textwrap.dedent(f"""
+            <div class="info-card">
+                <ul style="margin-bottom:0;">
+                    {key_text}
+                </ul>
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+
+    else:
+
+        st.markdown(
+            '<div class="info-card">'
+            '<span class="info-empty">No key points identified.</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+    # -----------------------------------------------------
+    # PEOPLE + ORGANIZATIONS
+    # -----------------------------------------------------
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        people_html = ""
+
+        if people:
+            people_html = "".join(
+                f"<li>{str(person)}</li>"
+                for person in people
+            )
         else:
-            sections["action_items"] = [
-                item.strip("- *•\n ")
-                for item in action_block.split("\n")
-                if item.strip()
-            ]
+            people_html = (
+                '<span class="info-empty">'
+                'No people identified.'
+                '</span>'
+            )
 
-    quality_match = re.search(
-        r"QUALITY:\s*(.*)",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    if quality_match:
-        sections["quality"] = quality_match.group(1).strip()
-
-    return sections
-
-
-def render_ai_analysis(raw_text):
-
-    analysis = parse_ai_analysis(raw_text)
-
-    quality_score = 0
-    quality_match = re.search(r"(\d{1,3})", analysis["quality"])
-    if quality_match:
-        quality_score = int(quality_match.group(1))
-
-    key_count = len(analysis["key_points"])
-    action_count = len(analysis["action_items"])
-
-    st.markdown(
-        """
-        <style>
-        .ai-metrics {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 14px;
-            margin: 18px 0 22px 0;
-        }
-        .ai-metric-card {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 14px;
-            padding: 18px 16px;
-        }
-        .ai-metric-label {
-            font-size: 12px;
-            color: #9aa8bd;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-            margin-bottom: 8px;
-        }
-        .ai-metric-value {
-            font-size: 28px;
-            font-weight: 700;
-            line-height: 1.2;
-        }
-        .ai-section-card {
-            background: rgba(255,255,255,0.03);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 14px;
-            padding: 18px 18px 10px 18px;
-            margin-bottom: 16px;
-        }
-        .ai-section-card h4 {
-            margin-top: 0;
-            margin-bottom: 10px;
-            color: #f3f6fb;
-        }
-        .ai-section-card ul {
-            margin-top: 8px;
-            margin-left: 18px;
-            padding-left: 0;
-        }
-        .ai-section-card li {
-            margin-bottom: 8px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        f"""
-        <div class="ai-metrics">
-            <div class="ai-metric-card">
-                <div class="ai-metric-label">Quality</div>
-                <div class="ai-metric-value">{quality_score}/100</div>
+        st.markdown(
+            textwrap.dedent(f"""
+            <div class="info-card">
+                <h4>👤 People</h4>
+                {"<ul>" + people_html + "</ul>" if people else people_html}
             </div>
-            <div class="ai-metric-card">
-                <div class="ai-metric-label">Key Points</div>
-                <div class="ai-metric-value">{key_count}</div>
+            """),
+            unsafe_allow_html=True
+        )
+
+    with col2:
+
+        org_html = ""
+
+        if organizations:
+            org_html = "".join(
+                f"<li>{str(org)}</li>"
+                for org in organizations
+            )
+        else:
+            org_html = (
+                '<span class="info-empty">'
+                'No organizations identified.'
+                '</span>'
+            )
+
+        st.markdown(
+            textwrap.dedent(f"""
+            <div class="info-card">
+                <h4>🏢 Organizations</h4>
+                {"<ul>" + org_html + "</ul>" if organizations else org_html}
             </div>
-            <div class="ai-metric-card">
-                <div class="ai-metric-label">Action Items</div>
-                <div class="ai-metric-value">{action_count}</div>
+            """),
+            unsafe_allow_html=True
+        )
+
+    # -----------------------------------------------------
+    # DATES + NUMBERS
+    # -----------------------------------------------------
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        date_html = ""
+
+        if dates:
+            date_html = "".join(
+                f"<li>{str(date)}</li>"
+                for date in dates
+            )
+        else:
+            date_html = (
+                '<span class="info-empty">'
+                'No dates or deadlines identified.'
+                '</span>'
+            )
+
+        st.markdown(
+            textwrap.dedent(f"""
+            <div class="info-card">
+                <h4>📅 Dates / Time References</h4>
+                {"<ul>" + date_html + "</ul>" if dates else date_html}
             </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """),
+            unsafe_allow_html=True
+        )
+
+    with col2:
+
+        number_html = ""
+
+        if numbers:
+            number_html = "".join(
+                f"<li>{str(number)}</li>"
+                for number in numbers
+            )
+        else:
+            number_html = (
+                '<span class="info-empty">'
+                'No important numbers identified.'
+                '</span>'
+            )
+
+        st.markdown(
+            textwrap.dedent(f"""
+            <div class="info-card">
+                <h4>🔢 Important Numbers</h4>
+                {"<ul>" + number_html + "</ul>" if numbers else number_html}
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+
+    # -----------------------------------------------------
+    # DECISIONS
+    # -----------------------------------------------------
 
     st.markdown(
-        """
-        <div class="ai-section-card">
-            <h4>📝 Summary</h4>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        '<div class="section-title">✅ Decisions</div>',
+        unsafe_allow_html=True
     )
-    st.write(analysis["summary"])
 
-    st.markdown(
-        """
-        <div class="ai-section-card">
-            <h4>🔑 Key Points</h4>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if analysis["key_points"]:
-        st.markdown("\n".join(f"- {item}" for item in analysis["key_points"]))
+    if decisions:
+
+        decision_html = "".join(
+            f"<li>{str(decision)}</li>"
+            for decision in decisions
+        )
+
+        st.markdown(
+            textwrap.dedent(f"""
+            <div class="info-card">
+                <ul style="margin-bottom:0;">
+                    {decision_html}
+                </ul>
+            </div>
+            """),
+            unsafe_allow_html=True
+        )
+
     else:
-        st.write("No key points identified.")
+
+        st.markdown(
+            '<div class="info-card">'
+            '<span class="info-empty">No explicit decisions identified.</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+    # -----------------------------------------------------
+    # ACTION ITEMS
+    # -----------------------------------------------------
 
     st.markdown(
-        """
-        <div class="ai-section-card">
-            <h4>✅ Action Items</h4>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        '<div class="section-title">📌 Action Items</div>',
+        unsafe_allow_html=True
     )
-    if analysis["action_items"]:
-        st.markdown("\n".join(f"- {item}" for item in analysis["action_items"]))
+
+    if action_items:
+
+        for item in action_items:
+
+            if not isinstance(item, dict):
+                continue
+
+            task = str(
+                item.get("task", "")
+            ).strip()
+
+            owner = str(
+                item.get("owner", "")
+            ).strip()
+
+            deadline = str(
+                item.get("deadline", "")
+            ).strip()
+
+            if not task:
+                continue
+
+            meta = []
+
+            if owner:
+                meta.append(
+                    f"Owner: {owner}"
+                )
+
+            if deadline:
+                meta.append(
+                    f"Deadline: {deadline}"
+                )
+
+            meta_html = (
+                " • ".join(meta)
+                if meta
+                else "Owner/deadline not specified"
+            )
+
+            st.markdown(
+                textwrap.dedent(f"""
+                <div class="action-card">
+                    <div class="action-task">📌 {task}</div>
+                    <div class="action-meta">{meta_html}</div>
+                </div>
+                """),
+                unsafe_allow_html=True
+            )
+
     else:
-        st.write("No specific action items identified.")
+
+        st.markdown(
+            '<div class="info-card">'
+            '<span class="info-empty">No specific action items identified.</span>'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+    # -----------------------------------------------------
+    # QUALITY
+    # -----------------------------------------------------
 
     st.markdown(
-        """
-        <div class="ai-section-card">
-            <h4>📊 Transcript Quality</h4>
-        </div>
-        """,
-        unsafe_allow_html=True,
+        '<div class="section-title">📊 Transcript Quality</div>',
+        unsafe_allow_html=True
     )
-    st.write(analysis["quality"])
+
+    st.progress(
+        quality_score / 100
+    )
+
+    st.write(
+        f"**Quality Score: {quality_score}/100**"
+    )
+
+    explanation = str(
+        quality.get("explanation", "")
+    ).strip()
+
+    if explanation:
+        st.caption(explanation)
+
+
+
+# =========================================================
+# TRANSCRIPT RAG
+# =========================================================
+
+@st.cache_resource
+def load_rag_embeddings():
+    """
+    Load a small local sentence-transformer embedding model.
+
+    The model is downloaded once and then cached by Streamlit.
+    """
+    from langchain_huggingface import HuggingFaceEmbeddings
+
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={
+            "device": "cpu"
+        },
+        encode_kwargs={
+            "normalize_embeddings": True
+        }
+    )
+
+
+@st.cache_resource
+def build_transcript_vectorstore(transcript):
+    """
+    Split the final transcript into overlapping chunks and
+    index them in an in-memory Chroma vector store.
+
+    The transcript itself is used as the cache key, so a new
+    transcript gets a new vector store automatically.
+    """
+
+    if not transcript or not transcript.strip():
+        raise ValueError(
+            "Cannot build RAG index from an empty transcript."
+        )
+
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_chroma import Chroma
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=700,
+        chunk_overlap=100,
+        length_function=len,
+        is_separator_regex=False
+    )
+
+    documents = splitter.create_documents(
+        [transcript]
+    )
+
+    for index, document in enumerate(documents):
+        document.metadata["chunk_id"] = index + 1
+        document.metadata["source"] = "final_transcript"
+
+    embeddings = load_rag_embeddings()
+
+    collection_suffix = hashlib.sha256(
+        transcript.encode("utf-8")
+    ).hexdigest()[:12]
+
+    vectorstore = Chroma.from_documents(
+        documents=documents,
+        embedding=embeddings,
+        collection_name=f"caption_craft_{collection_suffix}"
+    )
+
+    return vectorstore
+
+
+def answer_from_transcript(question, transcript):
+    """
+    Retrieve the most relevant transcript chunks and ask Groq
+    to answer using only those retrieved chunks.
+    """
+
+    client = load_ai_client()
+
+    if client is None:
+        raise ValueError(
+            "GROQ_API_KEY is not configured. "
+            "Add it to Streamlit secrets."
+        )
+
+    if not transcript or not transcript.strip():
+        raise ValueError(
+            "Generate a transcript before asking questions."
+        )
+
+    if not question or not question.strip():
+        raise ValueError(
+            "Please enter a question."
+        )
+
+    vectorstore = build_transcript_vectorstore(
+        transcript
+    )
+
+    results = vectorstore.similarity_search_with_score(
+        question.strip(),
+        k=4
+    )
+
+    if not results:
+        return {
+            "answer": (
+                "I couldn't find enough relevant information "
+                "in the transcript to answer that question."
+            ),
+            "sources": []
+        }
+
+    context_parts = []
+    sources = []
+
+    for document, score in results:
+
+        chunk_id = document.metadata.get(
+            "chunk_id",
+            "?"
+        )
+
+        context_parts.append(
+            f"[Transcript Chunk {chunk_id}]\n"
+            f"{document.page_content}"
+        )
+
+        sources.append({
+            "chunk_id": chunk_id,
+            "text": document.page_content,
+            "score": float(score)
+        })
+
+    context = "\n\n".join(
+        context_parts
+    )
+
+    prompt = f"""
+You are a retrieval-grounded transcript assistant.
+
+Answer the user's question using ONLY the transcript
+context provided below.
+
+If the answer is not supported by the context, say:
+"I couldn't find that information in the transcript."
+
+Do not invent facts.
+Do not use outside knowledge.
+Keep the answer concise but complete.
+When useful, mention the relevant transcript chunk number.
+
+TRANSCRIPT CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You answer questions only from retrieved "
+                    "transcript context. Never hallucinate."
+                )
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0,
+        max_tokens=700
+    )
+
+    answer = (
+        response.choices[0]
+        .message.content
+        .strip()
+    )
+
+    return {
+        "answer": answer,
+        "sources": sources
+    }
+
+
+def render_rag_sources(sources):
+    """
+    Display the transcript chunks retrieved by the vector search.
+    """
+
+    if not sources:
+        return
+
+    st.markdown(
+        "### 📚 Retrieved Transcript Context"
+    )
+
+    for source in sources:
+
+        chunk_id = source["chunk_id"]
+        text = source["text"]
+
+        with st.expander(
+            f"Transcript Chunk {chunk_id}"
+        ):
+            st.write(text)
 
 
 # =========================================================
@@ -514,74 +1040,411 @@ def render_ai_analysis(raw_text):
 # =========================================================
 
 st.markdown(
-    """
-    <style>
+    textwrap.dedent(
+        """
+        <style>
+        :root {
+            --bg: #02192a;
+            --bg-2: #061f32;
+            --panel: rgba(8, 26, 37, 0.94);
+            --panel-soft: rgba(12, 26, 36, 0.88);
+            --panel-elevated: rgba(17, 31, 42, 0.98);
+            --line: rgba(150, 170, 198, 0.16);
+            --line-strong: rgba(150, 170, 198, 0.3);
+            --text: #edf4ff;
+            --muted: #a5b8cf;
+            --muted-2: #7e93ad;
+            --accent-red: #f86f6b;
+            --accent-red-strong: #ff7d78;
+            --accent-blue: #4ea7ff;
+            --success: #31d66b;
+        }
 
-    .main-title {
-        font-size: 44px;
-        font-weight: 800;
-        text-align: center;
-        margin-bottom: 5px;
-    }
+        html, body, [data-testid="stAppViewContainer"] {
+            background: linear-gradient(180deg, var(--bg) 0%, #061c2d 100%);
+            color: var(--text);
+        }
 
-    .subtitle {
-        text-align: center;
-        color: #9aa8bd;
-        font-size: 17px;
-        margin-bottom: 30px;
-    }
+        .stApp {
+            background: linear-gradient(180deg, var(--bg) 0%, #061c2d 100%);
+        }
 
-    .final-box {
-        padding: 20px;
-        border-radius: 15px;
-        border: 1px solid rgba(255,255,255,0.10);
-        background: rgba(255,255,255,0.04);
-        margin-bottom: 15px;
-    }
+        .block-container {
+            max-width: 1360px;
+            padding-top: 0.5rem;
+            padding-bottom: 2.5rem;
+        }
 
-    .status-row {
-        display: flex;
-        gap: 10px;
-        flex-wrap: wrap;
-        margin-bottom: 12px;
-    }
+        .browser-shell {
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 16px;
+            overflow: hidden;
+            background: rgba(5, 16, 27, 0.9);
+            box-shadow: 0 18px 32px rgba(1, 5, 10, 0.28);
+             margin: 3rem 0 1rem;
+        }
 
-    .status-badge {
-        display: inline-block;
-        padding: 6px 12px;
-        border-radius: 999px;
-        background: rgba(46, 204, 113, 0.12);
-        border: 1px solid rgba(46, 204, 113, 0.35);
-        color: #dfffe7;
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-    }
+        .browser-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            background: linear-gradient(180deg, #1b1226 0%, #120d1f 100%);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+            padding: 10px 16px;
+            min-height: 48px;
+        }
 
-    .status-badge.neutral {
-        background: rgba(255,255,255,0.04);
-        border: 1px solid rgba(255,255,255,0.10);
-        color: #dfe7f5;
-    }
+        .browser-left,
+        .browser-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 120px;
+        }
 
-    div[data-testid="stTextArea"] > div {
-        border-radius: 16px;
-        border: 1px solid rgba(255,255,255,0.10);
-        background: rgba(255,255,255,0.02);
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
-    }
+        .browser-right {
+            justify-content: flex-end;
+        }
 
-    textarea {
-        background: transparent !important;
-        color: #f4f7fb !important;
-        font-size: 15px !important;
-        line-height: 1.6 !important;
-    }
+        .browser-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            box-shadow: inset 0 1px 1px rgba(255,255,255,0.18);
+        }
 
-    </style>
-    """,
-    unsafe_allow_html=True
+        .browser-dot.red { background: #ff6a5f; }
+        .browser-dot.yellow { background: #ffbf2f; }
+        .browser-dot.green { background: #36c85c; }
+
+        .browser-address {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .browser-pill {
+            min-width: 260px;
+            max-width: 520px;
+            width: 100%;
+            padding: 7px 14px;
+            border-radius: 12px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            color: rgba(214, 224, 240, 0.85);
+            font-size: 0.78rem;
+            text-align: center;
+            letter-spacing: 0.02em;
+        }
+
+        .browser-action {
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: #dfeaf9;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid rgba(255,255,255,0.07);
+            font-size: 0.72rem;
+        }
+
+        .browser-tabstrip {
+            display: flex;
+            align-items: flex-end;
+            gap: 10px;
+            padding: 10px 12px 0;
+            background: rgba(7, 18, 31, 0.9);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+            overflow-x: auto;
+        }
+
+        .browser-tab {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 14px 10px 12px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid transparent;
+            border-bottom: none;
+            border-radius: 10px 10px 0 0;
+            color: rgba(191, 205, 224, 0.8);
+            font-size: 0.76rem;
+            opacity: 0.82;
+        }
+
+        .browser-tab.active {
+            background: rgba(9, 24, 35, 1);
+            border-color: rgba(148, 163, 184, 0.14);
+            opacity: 1;
+            color: #edf4ff;
+        }
+
+        .browser-tab .favicon {
+            width: 12px;
+            height: 12px;
+            border-radius: 4px;
+            background: linear-gradient(135deg, #dff3ff, #3b82f6);
+            display: inline-block;
+        }
+
+        .browser-tab.active .favicon {
+            background: linear-gradient(135deg, #ffffff, #a5d8ff);
+        }
+
+        .hero-shell {
+            background: linear-gradient(180deg, rgba(4, 17, 27, 0.9), rgba(2, 14, 22, 0.98));
+            border-top: 1px solid rgba(148, 163, 184, 0.1);
+            min-height: 220px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem 1.2rem 1.4rem;
+        }
+
+        .hero-inner {
+            width: min(100%, 820px);
+            min-height: 172px;
+            background: rgba(7, 16, 25, 0.8);
+            border: 1px solid rgba(148, 163, 184, 0.10);
+            border-radius: 12px;
+            padding: 1.2rem 1.4rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 0.35rem;
+        }
+
+        .hero-title {
+            font-size: 2.7rem;
+            font-weight: 800;
+            letter-spacing: -0.06em;
+            margin: 0;
+            color: var(--text);
+            line-height: 1.08;
+        }
+
+        .hero-subtitle {
+            color: #d8e4f5;
+            font-size: 1rem;
+            letter-spacing: 0.02em;
+            margin: 0;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        }
+
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text);
+            margin: 1.3rem 0 0.6rem 0;
+        }
+
+        .section-subtitle {
+            color: var(--muted-2);
+            font-size: 0.82rem;
+            margin-bottom: 0.9rem;
+        }
+
+        .upload-card {
+            background: rgba(9, 19, 28, 0.72);
+            border: 1px solid rgba(150, 170, 198, 0.18);
+            border-radius: 18px;
+            padding: 0.1rem 0.2rem;
+            margin-bottom: 0.2rem;
+        }
+
+        [data-testid="stFileUploader"] > section {
+            background: rgba(9, 19, 28, 0.72);
+            border: 1px solid rgba(150, 170, 198, 0.18);
+            border-radius: 16px;
+            padding: 0.3rem 0.4rem;
+        }
+
+        [data-testid="stFileUploader"] label {
+            color: var(--text) !important;
+            font-weight: 600;
+        }
+
+        .upload-box {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 0.9rem 1.1rem;
+            border-radius: 14px;
+            background: rgba(12, 20, 28, 0.9);
+            border: 1px solid rgba(150, 170, 198, 0.18);
+            color: var(--muted);
+            min-height: 52px;
+        }
+
+        .upload-box .left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+        }
+
+        .upload-box .meta {
+            font-size: 0.8rem;
+            color: var(--muted-2);
+        }
+
+        .stButton > button,
+        .stDownloadButton > button {
+            border-radius: 18px !important;
+            border: none !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.01em;
+            transition: all 0.2s ease;
+            box-shadow: 0 10px 24px rgba(248, 111, 107, 0.24);
+        }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            transform: translateY(-1px);
+            filter: brightness(1.05);
+        }
+
+        .stButton > button[kind="primary"] {
+            background: linear-gradient(90deg, var(--accent-red) 0%, var(--accent-red-strong) 100%) !important;
+            color: white !important;
+            border-radius: 16px !important;
+            min-height: 52px;
+        }
+
+        .stDownloadButton > button {
+            background: linear-gradient(90deg, #1f8ac8, #4ea7ff) !important;
+            color: white !important;
+        }
+
+        .status-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin: 0.8rem 0 0.9rem 0;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: rgba(49, 214, 107, 0.12);
+            border: 1px solid rgba(49, 214, 107, 0.28);
+            color: #dffef0;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .status-badge.neutral {
+            background: rgba(78, 167, 255, 0.12);
+            border: 1px solid rgba(78, 167, 255, 0.25);
+            color: #dfeeff;
+        }
+
+        div[data-testid="stTextArea"] > div {
+            border-radius: 14px;
+            border: 1px solid rgba(150, 170, 198, 0.18);
+            background: rgba(7, 17, 27, 0.86);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+        }
+
+        textarea {
+            background: transparent !important;
+            color: #edf5ff !important;
+            font-size: 15px !important;
+            line-height: 1.6 !important;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace !important;
+        }
+
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(120px, 1fr));
+            gap: 12px;
+            margin: 16px 0 24px 0;
+        }
+
+        .metric-card {
+            padding: 18px 16px;
+            border-radius: 16px;
+            border: 1px solid rgba(150, 170, 198, 0.12);
+            background: rgba(9, 20, 29, 0.74);
+        }
+
+        .metric-label {
+            color: var(--muted-2);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .metric-value {
+            margin-top: 8px;
+            color: var(--text);
+            font-size: 1.7rem;
+            font-weight: 800;
+            line-height: 1.2;
+        }
+
+        .info-card {
+            min-height: 145px;
+            padding: 18px;
+            border-radius: 16px;
+            border: 1px solid rgba(150, 170, 198, 0.12);
+            background: rgba(7, 18, 28, 0.72);
+            margin-bottom: 14px;
+        }
+
+        .info-card h4 {
+            margin: 0 0 10px 0;
+            color: var(--text);
+            font-size: 1rem;
+        }
+
+        .info-empty {
+            color: var(--muted-2);
+        }
+
+        .action-card {
+            padding: 15px 17px;
+            border-radius: 14px;
+            border: 1px solid rgba(150, 170, 198, 0.12);
+            background: rgba(8, 20, 28, 0.7);
+            margin-bottom: 10px;
+        }
+
+        .action-task {
+            color: var(--text);
+            font-weight: 700;
+            font-size: 15px;
+            margin-bottom: 5px;
+        }
+
+        .action-meta {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .stProgress > div > div {
+            background: linear-gradient(90deg, var(--accent-blue), #90d0ff);
+        }
+
+        @media (max-width: 800px) {
+            .hero-title { font-size: 2.1rem; }
+            .browser-pill { min-width: 180px; }
+            .metric-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+        </style>
+        """
+    ),
+    unsafe_allow_html=True,
 )
 
 
@@ -589,34 +1452,66 @@ st.markdown(
 # HEADER
 # =========================================================
 
-st.markdown(
-    "<div class='main-title'>🎙️ Caption Craft</div>",
-    unsafe_allow_html=True
-)
+st.html("""
+<div class="browser-shell">
+    <div class="browser-bar">
+        <div class="browser-left">
+            <span class="browser-dot red"></span>
+            <span class="browser-dot yellow"></span>
+            <span class="browser-dot green"></span>
+        </div>
 
-st.markdown(
-    """
-    <div class='subtitle'>
-        Hybrid Indian Accent Speech Recognition
+        <div class="browser-address">
+            <div class="browser-pill">localhost:8501</div>
+        </div>
+
+        <div class="browser-right">
+            <span class="browser-action">＋</span>
+            <span class="browser-action">↻</span>
+        </div>
     </div>
-    """,
-    unsafe_allow_html=True
-)
 
-st.divider()
+    <div class="browser-tabstrip">
+        <div class="browser-tab active">
+            <span class="favicon"></span>
+            <span>Caption Craft</span>
+        </div>
 
+        <div class="browser-tab">
+            <span class="favicon"></span>
+            <span>Caption Craft</span>
+        </div>
 
-# =========================================================
+        <div class="browser-tab">
+            <span class="favicon"></span>
+            <span>Caption Craft</span>
+        </div>
+    </div>
+
+    <div class="hero-shell">
+        <div class="hero-inner">
+            <h1 class="hero-title">Caption Craft</h1>
+            <div class="hero-subtitle">Hybrid Indian Accent Speech Recognition</div>
+        </div>
+    </div>
+</div>
+""")
+
 # AUDIO UPLOAD
 # =========================================================
 
 st.markdown(
-    "### 🎧 Upload Audio"
+    '<div class="section-title">🎧 Upload Audio</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="upload-card">',
+    unsafe_allow_html=True
 )
 
 uploaded = st.file_uploader(
     "Choose an audio file",
-
     type=[
         "wav",
         "flac",
@@ -624,9 +1519,11 @@ uploaded = st.file_uploader(
         "m4a",
         "ogg"
     ],
-
-    help="Upload an audio file for transcription."
+    help="Upload an audio file for transcription.",
+    label_visibility="collapsed"
 )
+
+st.markdown('</div>', unsafe_allow_html=True)
 
 
 # =========================================================
@@ -635,20 +1532,32 @@ uploaded = st.file_uploader(
 
 if uploaded is not None:
 
-    audio_bytes = uploaded.getvalue()
+    st.audio(
+        uploaded.getvalue()
+    )
 
-    st.audio(audio_bytes)
+    st.caption(
+        f"Selected file: **{uploaded.name}**"
+    )
 
 
 # =========================================================
 # TRANSCRIBE BUTTON
 # =========================================================
 
-if st.button(
-    "🚀 Transcribe Audio",
-    type="primary",
-    use_container_width=True
-):
+transcribe_col1, transcribe_col2, transcribe_col3 = st.columns(
+    [1, 8, 1]
+)
+
+with transcribe_col2:
+    transcribe_clicked = st.button(
+        "🎙️ Transcribe Audio",
+        type="primary",
+        use_container_width=True
+    )
+
+
+if transcribe_clicked:
 
     if uploaded is None:
 
@@ -660,6 +1569,12 @@ if st.button(
 
 
     try:
+        import numpy as np
+        import soundfile as sf
+        import torch
+        import torchaudio
+
+        from app import predict, device
 
         # =================================================
         # READ AUDIO
@@ -802,33 +1717,22 @@ if st.button(
 
 
         # =================================================
-        # STAGE 3 — FINAL TRANSCRIPT SELECTION
+        # STAGE 3 — HYBRID TRANSCRIPT FUSION
         # =================================================
 
         with st.spinner(
-            "🔄 Comparing final transcript outputs..."
+            "🔄 Creating final hybrid transcript..."
         ):
 
             compare_start = time.perf_counter()
 
-            custom_normalized = normalize_text(
-                custom_transcript
-            )
-
-            whisper_normalized = normalize_text(
+            # Intelligently reconcile the Custom BiLSTM and
+            # Whisper outputs instead of automatically discarding
+            # the custom model whenever the outputs differ.
+            final_transcript = create_hybrid_transcript(
+                custom_transcript,
                 whisper_transcript
             )
-
-            if custom_normalized == whisper_normalized:
-
-                # Both models produced the same result
-                final_transcript = custom_transcript
-
-            else:
-
-                # Models produced different results
-                # Use Whisper as the final output
-                final_transcript = whisper_transcript
 
             comparison_time = (
                 time.perf_counter()
@@ -916,75 +1820,69 @@ if "final_transcript" in st.session_state:
 
     st.divider()
 
-
     st.markdown(
-        "## 📝 Final Transcript"
+        '<div class="section-title">📝 Final Transcript</div>',
+        unsafe_allow_html=True
     )
 
     st.markdown(
-        """
-        <div class='status-row'>
-            <span class='status-badge'>Ready</span>
-            <span class='status-badge neutral'>Final Output</span>
-        </div>
-        """,
+        """<div class="status-row">
+    <span class="status-badge">✓ Ready</span>
+    <span class="status-badge neutral">Hybrid Output</span>
+</div>
+""",
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """<div style="margin-bottom: 10px; color: #c9d9ef; font-size: 0.8rem; letter-spacing: 0.06em; text-transform: uppercase; opacity: 0.8;">
+    Final Transcript
+</div>
+""",
         unsafe_allow_html=True
     )
 
     st.text_area(
         "Final transcription",
-
-        value=st.session_state[
-            "final_transcript"
-        ],
-
-        height=250,
-
+        value=st.session_state["final_transcript"],
+        height=220,
         label_visibility="collapsed"
     )
 
+    info_col1, info_col2, info_col3 = st.columns(3)
 
-    # =====================================================
-    # PROCESSING INFORMATION
-    # =====================================================
-
-    col1, col2 = st.columns(2)
-
-
-    with col1:
-
+    with info_col1:
         st.caption(
-            f"⏱️ Total processing time: "
-            f"{st.session_state['transcription_time']:.2f} seconds"
+            f"⏱️ Processing: "
+            f"{st.session_state['transcription_time']:.2f} sec"
         )
 
-
-    with col2:
-
+    with info_col2:
         st.caption(
-            f"🌐 Detected language: "
+            f"🌐 Language: "
             f"{st.session_state['language']}"
         )
 
+    with info_col3:
+        word_count = len(
+            st.session_state["final_transcript"].split()
+        )
+        st.caption(
+            f"📝 Words: {word_count}"
+        )
 
-    # =====================================================
-    # DOWNLOAD
-    # =====================================================
-
-    st.download_button(
-
-        "⬇️ Download Final Transcript",
-
-        data=st.session_state[
-            "final_transcript"
-        ],
-
-        file_name="caption_craft_transcription.txt",
-
-        mime="text/plain",
-
-        use_container_width=True
+    download_col1, download_col2, download_col3 = st.columns(
+        [1, 2, 1]
     )
+
+    with download_col2:
+        st.download_button(
+            "⬇️ Download Final Transcript",
+            data=st.session_state["final_transcript"],
+            file_name="caption_craft_transcription.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
 
 
     # =====================================================
@@ -993,26 +1891,35 @@ if "final_transcript" in st.session_state:
 
     st.divider()
 
+    st.markdown(
+        '<div class="section-title">🧠 AI Transcript Intelligence</div>',
+        unsafe_allow_html=True
+    )
 
     st.markdown(
-        "## 🧠 AI Transcript Intelligence"
+        '<div class="section-subtitle">'
+        'Convert the transcript into structured, actionable information.'
+        '</div>',
+        unsafe_allow_html=True
     )
 
-    st.caption(
-        "✨ AI summary, key points, action items, and transcript quality"
+    analyze_col1, analyze_col2, analyze_col3 = st.columns(
+        [1, 2, 1]
     )
 
-    if st.button(
-        "✨ Analyze Transcript",
-        type="primary",
-        use_container_width=True
-    ):
+    with analyze_col2:
+        analyze_clicked = st.button(
+            "✨ Analyze Transcript",
+            type="primary",
+            use_container_width=True
+        )
+
+    if analyze_clicked:
 
         transcript = st.session_state.get(
             "final_transcript",
             ""
         )
-
 
         if not transcript.strip():
 
@@ -1025,20 +1932,20 @@ if "final_transcript" in st.session_state:
             try:
 
                 with st.spinner(
-                    "🧠 AI is analyzing your transcript..."
+                    "🧠 Extracting structured information..."
                 ):
 
-                    ai_analysis = (
-                        analyze_transcript(
-                            transcript
-                        )
+                    ai_analysis = analyze_transcript(
+                        transcript
                     )
-
 
                 st.session_state[
                     "ai_analysis"
                 ] = ai_analysis
 
+                st.success(
+                    "✅ Transcript analysis completed."
+                )
 
             except Exception as e:
 
@@ -1053,6 +1960,114 @@ if "final_transcript" in st.session_state:
 
     if "ai_analysis" in st.session_state:
 
+        analysis = st.session_state[
+            "ai_analysis"
+        ]
+
+
         render_ai_analysis(
-            st.session_state["ai_analysis"]
+            analysis
+        )
+
+
+    # =====================================================
+    # ASK YOUR TRANSCRIPT — RAG
+    # =====================================================
+
+    st.divider()
+
+    st.markdown(
+        '<div class="section-title">🔎 Ask Your Transcript</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="section-subtitle">'
+        'Ask questions about the transcript. Caption Craft retrieves '
+        'the most relevant transcript sections before generating an answer.'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+    st.info(
+        "💡 Example: **What did Rahul agree to do?**  "
+        "or **What financial numbers were mentioned?**"
+    )
+
+    question = st.text_input(
+        "Ask a question",
+        placeholder="What was the main decision discussed?",
+        key="rag_question"
+    )
+
+    ask_col1, ask_col2, ask_col3 = st.columns(
+        [1, 2, 1]
+    )
+
+    with ask_col2:
+
+        ask_clicked = st.button(
+            "🔎 Ask Transcript",
+            type="primary",
+            use_container_width=True
+        )
+
+    if ask_clicked:
+
+        if not question.strip():
+
+            st.warning(
+                "Please enter a question."
+            )
+
+        else:
+
+            try:
+
+                with st.spinner(
+                    "🔍 Retrieving relevant transcript context..."
+                ):
+
+                    rag_result = answer_from_transcript(
+                        question,
+                        st.session_state["final_transcript"]
+                    )
+
+                st.session_state[
+                    "rag_result"
+                ] = rag_result
+
+                st.success(
+                    "✅ Answer generated from the transcript."
+                )
+
+            except Exception as e:
+
+                st.error(
+                    f"❌ RAG question failed: {e}"
+                )
+
+
+    # =====================================================
+    # DISPLAY RAG ANSWER
+    # =====================================================
+
+    if "rag_result" in st.session_state:
+
+        rag_result = st.session_state[
+            "rag_result"
+        ]
+
+        st.markdown(
+            "### 💬 Answer"
+        )
+
+        st.html(f"""
+<div class="info-card">
+    {rag_result.get("answer", "No answer available.")}
+</div>
+""")
+
+        render_rag_sources(
+            rag_result.get("sources", [])
         )
