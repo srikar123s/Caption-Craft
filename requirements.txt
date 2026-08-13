@@ -1,8 +1,10 @@
+streamlit
 torch
 torchaudio
-fastapi
-uvicorn[standard]
-python-multipart
 soundfile
-numpy
-streamlit
+groq
+fastapi
+uvicorn
+python-multipart
+pydantic
+faster-whisper
